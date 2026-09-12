@@ -22,6 +22,7 @@ import joblib
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -39,6 +40,15 @@ MODEL_PATH = os.environ.get("ALTUR_MODEL_PATH", "models/model.joblib")
 AUDIO_FIELD_NAMES = ("audio_base64", "audio", "wav_base64", "wav", "audio_wav_base64")
 
 app = FastAPI(title="Altur Challenge - Human vs Synthetic Caller Detector (fusion)")
+
+# Permite que una página web (la herramienta de demo, o el harness de los
+# jueces) llame al endpoint directo desde el navegador sin ser bloqueada.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _bundle = None
 
