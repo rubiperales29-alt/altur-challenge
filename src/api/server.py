@@ -1,14 +1,16 @@
 """
-Servidor de evaluación del reto Altur.
+Servidor de evaluación del reto Altur — versión fusionada (features propias +
+features de timing de Gabi), con manejo flexible del nombre del campo de audio.
 
 POST /detect
-    body: {"audio_base64": "<wav base64>"}   (stereo, 8kHz, 16-bit PCM,
-                                               canal 0 = caller, canal 1 = agente)
+    body: JSON con el WAV en base64 bajo uno de varios nombres de campo
+          posibles (el reto no especifica el nombre exacto, así que aceptamos
+          los más comunes: audio_base64, audio, wav_base64, wav,
+          audio_wav_base64).
     resp: {"is_synthetic": true, "confidence": 0.87}
 
 Arranca con:
     uvicorn api.server:app --host 0.0.0.0 --port 8000
-(ejecutar desde la carpeta src/, o ajustar PYTHONPATH)
 """
 from __future__ import annotations
 import base64
@@ -19,7 +21,7 @@ import sys
 import joblib
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -27,11 +29,16 @@ from features.turn_detection import detect_turns
 from features.timing_features import compute_timing_features
 from features.acoustic_features import compute_acoustic_features
 from features.linguistic_features import compute_linguistic_features
-from features.feature_pipeline import features_to_vector
+from features.gabi_timing_features import turn_features_gabi, add_duration_features_gabi
+from features.feature_pipeline import features_to_vector, _turns_to_dicts
 
 MODEL_PATH = os.environ.get("ALTUR_MODEL_PATH", "models/model.joblib")
 
-app = FastAPI(title="Altur Challenge - Human vs Synthetic Caller Detector")
+# El reto nunca especifica el nombre exacto del campo JSON del audio en base64
+# -- aceptamos varios nombres comunes para no fallar por un detalle de formato.
+AUDIO_FIELD_NAMES = ("audio_base64", "audio", "wav_base64", "wav", "audio_wav_base64")
+
+app = FastAPI(title="Altur Challenge - Human vs Synthetic Caller Detector (fusion)")
 
 _bundle = None
 
@@ -45,11 +52,6 @@ def _load_model():
             )
         _bundle = joblib.load(MODEL_PATH)
     return _bundle
-
-
-class DetectRequest(BaseModel):
-    audio_base64: str
-    use_asr: bool = False  # dejar en False para latencia baja en evaluación
 
 
 class DetectResponse(BaseModel):
@@ -67,13 +69,30 @@ def startup():
 
 
 @app.post("/detect", response_model=DetectResponse)
-def detect(req: DetectRequest):
+async def detect(request: Request):
     bundle = _load_model()
     clf = bundle["model"]
     feature_names = bundle["feature_names"]
 
     try:
-        raw = base64.b64decode(req.audio_base64)
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="el body debe ser JSON")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="el body debe ser un objeto JSON")
+
+    b64 = next((body[k] for k in AUDIO_FIELD_NAMES if body.get(k)), None)
+    if b64 is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"falta el audio en base64; se espera uno de estos campos: {AUDIO_FIELD_NAMES}",
+        )
+
+    use_asr = bool(body.get("use_asr", False))
+
+    try:
+        raw = base64.b64decode(b64, validate=True)
         audio, sr = sf.read(io.BytesIO(raw), always_2d=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"WAV inválido: {e}")
@@ -91,9 +110,15 @@ def detect(req: DetectRequest):
     feats = {}
     feats.update(compute_timing_features(caller_turns, agent_turns, duration_s))
     feats.update(compute_acoustic_features(ch0, sr, caller_turns))
-    feats.update(compute_linguistic_features(""))  # placeholder si use_asr=False
 
-    if req.use_asr:
+    gabi_turns = _turns_to_dicts(caller_turns, agent_turns)
+    gabi_feats = turn_features_gabi(gabi_turns)
+    gabi_feats = add_duration_features_gabi(gabi_feats, duration_s)
+    feats.update(gabi_feats)
+
+    feats.update(compute_linguistic_features(""))
+
+    if use_asr:
         from features.linguistic_features import transcribe_caller
         transcript = transcribe_caller(ch0, sr, caller_turns)
         feats.update(compute_linguistic_features(transcript))

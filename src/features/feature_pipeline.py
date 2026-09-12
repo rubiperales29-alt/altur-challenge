@@ -14,6 +14,14 @@ from .turn_detection import detect_turns, Turn
 from .timing_features import compute_timing_features
 from .acoustic_features import compute_acoustic_features
 from .linguistic_features import transcribe_caller, compute_linguistic_features
+from .gabi_timing_features import turn_features_gabi, add_duration_features_gabi
+
+
+def _turns_to_dicts(caller_turns: list[Turn], agent_turns: list[Turn]) -> list[dict]:
+    """Adapta nuestros objetos Turn al formato dict que usa el módulo de Gabi."""
+    out = [{"channel": 0, "start": t.start, "end": t.end} for t in caller_turns]
+    out += [{"channel": 1, "start": t.start, "end": t.end} for t in agent_turns]
+    return out
 
 
 def _load_stereo_wav(path: str):
@@ -63,6 +71,13 @@ def extract_features_from_file(
     feats = {}
     feats.update(compute_timing_features(caller_turns, agent_turns, duration_s))
     feats.update(compute_acoustic_features(ch0, sr, caller_turns))
+
+    # Features de timing de Gabi (complementarias: resp_lat_cv, stop_delay,
+    # silence_broken_by_caller, normalización anti-fuga por duración)
+    gabi_turns = _turns_to_dicts(caller_turns, agent_turns)
+    gabi_feats = turn_features_gabi(gabi_turns)
+    gabi_feats = add_duration_features_gabi(gabi_feats, duration_s)
+    feats.update(gabi_feats)
 
     if use_asr:
         transcript = transcribe_caller(ch0, sr, caller_turns)
