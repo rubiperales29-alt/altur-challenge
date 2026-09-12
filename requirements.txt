@@ -1,0 +1,11 @@
+numpy
+scipy
+soundfile
+librosa
+scikit-learn
+joblib
+fastapi
+uvicorn[standard]
+pydantic
+# opcional, solo si activas use_asr=True (features lingüísticas):
+# faster-whisper
