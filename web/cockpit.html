@@ -126,7 +126,8 @@
           <h3>Arrastra o selecciona un audio</h3>
           <p>El canal 0 se analiza; el canal 1 (agente) da contexto.</p>
           <div class="fmt-pill"><span class="dot"></span> PCM 16-bit · 8kHz · Estéreo (telefonía)</div>
-          <input accept=".wav" id="audio-input" type="file">
+          <div class="fmt-pill" style="margin-top:6px;"><span class="dot"></span> o un .json con el payload del contrato (call_id, audio_base64, sample_rate, channels)</div>
+          <input accept=".wav,.json" id="audio-input" type="file">
         </div>
 
         <div id="waves" style="display:none;">
@@ -265,6 +266,18 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
+function base64ToArrayBuffer(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// Nombres de campo aceptados para el audio en base64 dentro de un .json
+// arrastrado directo (mismos alias que acepta el backend, el oficial del
+// reto es audio_base64).
+const JSON_AUDIO_FIELDS = ['audio_base64', 'audio', 'wav_base64', 'wav', 'audio_wav_base64'];
+
 // --- parser de WAV (real, no decorativo) para dibujar la forma de onda real ---
 function parseWav(buffer) {
   const view = new DataView(buffer);
@@ -341,7 +354,30 @@ async function handleFile(file) {
 
   try {
     const t0 = performance.now();
-    const buffer = await file.arrayBuffer();
+    const isJsonFile = file.name.toLowerCase().endsWith('.json') || file.type === 'application/json';
+
+    let buffer, requestBody;
+
+    if (isJsonFile) {
+      // El .json ya trae el payload completo del contrato (call_id,
+      // audio_base64, sample_rate, channels) — lo mandamos tal cual al
+      // backend, y decodificamos audio_base64 aquí solo para poder dibujar
+      // la forma de onda igual que con un WAV.
+      const text = await file.text();
+      let parsedJson;
+      try { parsedJson = JSON.parse(text); }
+      catch (e) { throw new Error('el .json no es JSON válido'); }
+
+      const b64 = JSON_AUDIO_FIELDS.map(k => parsedJson[k]).find(Boolean);
+      if (!b64) throw new Error(`el .json no trae ninguno de estos campos: ${JSON_AUDIO_FIELDS.join(', ')}`);
+
+      buffer = base64ToArrayBuffer(b64);
+      requestBody = text;
+    } else {
+      buffer = await file.arrayBuffer();
+      requestBody = JSON.stringify({ audio_base64: arrayBufferToBase64(buffer) });
+    }
+
     const parsed = parseWav(buffer);
     const durationS = parsed.dataSize / (parsed.fmt.sampleRate * parsed.fmt.blockAlign);
 
@@ -351,14 +387,13 @@ async function handleFile(file) {
     const tDecode = performance.now();
     setStage('stage-decode', '', `${(tDecode - t0).toFixed(0)} ms`);
 
-    const b64 = arrayBufferToBase64(buffer);
     statusEl.textContent = 'Enviando al servidor (VAD + features + modelo)…';
 
     const reqStart = performance.now();
     const resp = await fetch(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio_base64: b64 })
+      body: requestBody
     });
     const reqEnd = performance.now();
 
