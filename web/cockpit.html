@@ -49,6 +49,7 @@
   .wave-row{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:10px;background:#05070b;border:1px solid var(--line);margin-top:14px;}
   .wave-label{display:flex;justify-content:space-between;font-size:11px;font-family:'JetBrains Mono',monospace;}
   canvas.wave{width:100%;height:56px;display:block;}
+  canvas.turns-canvas{width:100%;height:130px;display:block;}
 
   .pipeline{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:14px;}
   @media(min-width:480px){.pipeline{grid-template-columns:repeat(4,1fr);}}
@@ -127,6 +128,7 @@
           <p>El canal 0 se analiza; el canal 1 (agente) da contexto.</p>
           <div class="fmt-pill"><span class="dot"></span> PCM 16-bit · 8kHz · Estéreo (telefonía)</div>
           <div class="fmt-pill" style="margin-top:6px;"><span class="dot"></span> o un .json con el payload del contrato (call_id, audio_base64, sample_rate, channels)</div>
+          <div class="fmt-pill" style="margin-top:6px;"><span class="dot"></span> o un turns.json de depuración (lista de turnos por canal) — solo se visualiza</div>
           <input accept=".wav,.json" id="audio-input" type="file">
         </div>
 
@@ -138,6 +140,19 @@
           <div class="wave-row">
             <div class="wave-label"><span style="color:#94a3b8;font-weight:700;">CANAL 1 · AGENTE (contexto)</span></div>
             <canvas class="wave" id="wave1" height="56"></canvas>
+          </div>
+        </div>
+
+        <div id="turns-panel" style="display:none;">
+          <div class="wave-row">
+            <div class="wave-label">
+              <span style="color:#38bdf8;font-weight:700;">● CANAL 0 · LLAMANTE</span>
+              <span style="color:#ff4d6d;font-weight:700;">● CANAL 1 · AGENTE</span>
+            </div>
+            <canvas class="turns-canvas" id="turns-canvas"></canvas>
+            <div style="font-size:11px;color:#64748b;margin-top:6px;">
+              Línea de tiempo de turnos (turns.json) — solo depuración/visualización, no se manda a /detect.
+            </div>
           </div>
         </div>
       </div>
@@ -235,6 +250,8 @@ const audioInput = document.getElementById('audio-input');
 const wavesWrap = document.getElementById('waves');
 const wave0canvas = document.getElementById('wave0');
 const wave1canvas = document.getElementById('wave1');
+const turnsPanel = document.getElementById('turns-panel');
+const turnsCanvas = document.getElementById('turns-canvas');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const latencyCounter = document.getElementById('latency-counter');
@@ -351,6 +368,52 @@ function drawWaveform(canvas, buffer, parsed, channelIndex) {
   }
 }
 
+// Dibuja la línea de tiempo de turnos (diarización) de un turns.json, igual
+// idea que el ejemplo de matplotlib: una barra horizontal por turno,
+// posicionada por su start/end, con una fila por canal.
+function drawTurnsTimeline(canvas, turns) {
+  const width = canvas.clientWidth || 560;
+  const height = 130;
+  canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, width, height);
+  if (!turns.length) return;
+
+  const maxT = Math.max(...turns.map(t => t.end));
+  const marginLeft = 8, marginRight = 8, marginTop = 10, marginBottom = 22;
+  const plotW = width - marginLeft - marginRight;
+  const plotH = height - marginTop - marginBottom;
+  const rowH = plotH / 2;
+  const colors = { 0: '#38bdf8', 1: '#ff4d6d' };
+
+  // grid vertical + eje de tiempo
+  ctx.strokeStyle = '#1e2638';
+  ctx.fillStyle = '#64748b';
+  ctx.font = '10px JetBrains Mono, monospace';
+  const steps = 6;
+  for (let i = 0; i <= steps; i++) {
+    const t = (maxT / steps) * i;
+    const x = marginLeft + (t / maxT) * plotW;
+    ctx.beginPath(); ctx.moveTo(x, marginTop); ctx.lineTo(x, marginTop + plotH); ctx.stroke();
+    ctx.fillText(`${t.toFixed(0)}s`, Math.min(x, width - 28), height - 6);
+  }
+
+  // línea divisoria entre canales
+  ctx.strokeStyle = '#263248';
+  ctx.beginPath(); ctx.moveTo(marginLeft, marginTop + rowH); ctx.lineTo(marginLeft + plotW, marginTop + rowH); ctx.stroke();
+
+  // barras: canal 1 (agente) arriba, canal 0 (llamante) abajo
+  turns.forEach(t => {
+    const row = t.channel === 0 ? 1 : 0;
+    const x = marginLeft + (t.start / maxT) * plotW;
+    const w = Math.max(2, ((t.end - t.start) / maxT) * plotW);
+    const y = marginTop + row * rowH + rowH * 0.22;
+    const h = rowH * 0.56;
+    ctx.fillStyle = colors[t.channel] ?? '#94a3b8';
+    ctx.fillRect(x, y, w, h);
+  });
+}
+
 function setStage(id, label, ms) {
   const el = document.getElementById(id);
   el.classList.remove('pending');
@@ -375,6 +438,8 @@ async function handleFile(file) {
   statusEl.style.display = 'block';
   statusEl.textContent = 'Leyendo archivo…';
   resetStages();
+  wavesWrap.style.display = 'none';
+  turnsPanel.style.display = 'none';
 
   try {
     const t0 = performance.now();
@@ -393,7 +458,22 @@ async function handleFile(file) {
       catch (e) { throw new Error('el .json no es JSON válido'); }
 
       const b64 = JSON_AUDIO_FIELDS.map(k => parsedJson[k]).find(Boolean);
-      if (!b64) throw new Error(`el .json no trae ninguno de estos campos: ${JSON_AUDIO_FIELDS.join(', ')}`);
+
+      // turns.json de depuración (data/turns/<id>.json): no trae audio, solo
+      // la lista de turnos por canal. No es el contrato del reto, así que
+      // solo lo visualizamos — no se manda nada a /detect.
+      if (!b64 && Array.isArray(parsedJson.turns)) {
+        wavesWrap.style.display = 'none';
+        turnsPanel.style.display = 'block';
+        drawTurnsTimeline(turnsCanvas, parsedJson.turns);
+
+        verdictBody.style.display = 'none';
+        verdictPlaceholder.style.display = 'block';
+        verdictPlaceholder.textContent = 'turns.json cargado: es solo una visualización de diarización (sin audio), no se evaluó contra /detect.';
+        return;
+      }
+
+      if (!b64) throw new Error(`el .json no trae 'audio_base64' (ni alias) ni una lista 'turns' — no sé cómo interpretarlo`);
 
       buffer = base64ToArrayBuffer(b64);
       requestBody = text;
