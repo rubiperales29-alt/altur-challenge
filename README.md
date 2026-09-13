@@ -7,6 +7,35 @@ es una persona real o un sistema autónomo (ASR → LLM → TTS).
 > Nota: plan free de Render — se "duerme" tras ~15 min sin uso. Mandar una
 > petición de prueba unos minutos antes de la evaluación en vivo.
 
+## Contrato oficial del juez (confirmado por los organizadores)
+
+El benchmark corre **desde la laptop de los jueces contra nuestro endpoint
+desplegado**, **antes** de la explicación del proyecto, con **~100 llamadas**
+del set oculto (mismo motor de voz que train/val, pero hablantes nuevos).
+
+Request:
+```json
+{"call_id": "...", "audio_base64": "<base64 del WAV completo>", "sample_rate": 8000, "channels": 2}
+```
+`audio_base64` decodifica los bytes exactos de un WAV estéreo: canal 0 =
+caller, canal 1 = agente.
+
+Response esperada: HTTP 200 con
+```json
+{"is_synthetic": true, "confidence": 0.87}
+```
+`is_synthetic` es obligatorio; `confidence` es opcional pero se usa para
+desempate y para medir calibración.
+
+**Regla crítica:** un timeout, un status != 200, o una respuesta sin
+`is_synthetic` booleano cuenta como respuesta incorrecta — igual que una
+predicción equivocada. Por eso `api/server.py` nunca deja escapar una
+excepción como error HTTP: cualquier fallo interno (JSON malformado, base64
+corrupto, WAV inválido) cae a una respuesta de fallback con status 200.
+
+Entrega en Devpost: **repositorio + URL del endpoint desplegado** (nada de
+video/capturas obligatorias).
+
 ## Resultados (split val, speaker-disjoint)
 
 | Métrica | Valor |
