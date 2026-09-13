@@ -4,8 +4,27 @@ Clasifica si el caller (canal 0) de una llamada de servicio al cliente bancario
 es una persona real o un sistema autónomo (ASR → LLM → TTS).
 
 **Endpoint en producción:** `https://altur-challenge.onrender.com/detect`
-> Nota: plan free de Render — se "duerme" tras ~15 min sin uso. Mandar una
-> petición de prueba unos minutos antes de la evaluación en vivo.
+> Nota: plan free de Render — se "duerme" tras ~15 min sin tráfico entrante.
+> Mitigado con keep-alive automático (ver abajo), pero de todos modos corran
+> `scripts/warmup.py` unos minutos antes de la evaluación en vivo.
+
+## Warm-up antes de la evaluación
+
+Dos capas, para no depender de una sola:
+
+1. **Keep-alive automático** (`src/api/server.py`): mientras el proceso siga
+   corriendo, se auto-pinguea `/health` cada 10 min (< 15 min del timeout de
+   Render), usando `RENDER_EXTERNAL_URL` que Render define solo. No requiere
+   ninguna acción manual una vez desplegado — el servicio deja de dormirse
+   por completo.
+2. **Warm-up manual** (`scripts/warmup.py`), por si el servicio se
+   redesplegó hace poco o el keep-alive aún no alcanzó a activarse: manda
+   llamadas reales a `/detect` (no solo `/health`) para calentar también el
+   pipeline de features, y confirma que la latencia ya bajó a un rango
+   razonable antes de que el juez se siente en la mesa.
+   ```bash
+   python scripts/warmup.py --url https://altur-challenge.onrender.com
+   ```
 
 ## Contrato oficial del juez (confirmado por los organizadores)
 

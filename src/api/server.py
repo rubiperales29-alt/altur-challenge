@@ -18,11 +18,13 @@ Arranca con:
     uvicorn api.server:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
+import asyncio
 import base64
 import io
 import os
 import sys
 import traceback
+import urllib.request
 
 import joblib
 import numpy as np
@@ -50,6 +52,15 @@ AUDIO_FIELD_NAMES = ("audio_base64", "audio", "wav_base64", "wav", "audio_wav_ba
 # Respuesta de emergencia: siempre HTTP 200 y con is_synthetic booleano, tal
 # como exige el juez, incluso si no pudimos ni parsear el request.
 FALLBACK_RESPONSE = {"is_synthetic": False, "confidence": 0.5}
+
+# Keep-alive: el plan free de Render duerme el servicio tras ~15 min sin
+# tráfico entrante. Mientras el proceso esté vivo, se hace ping a su propia
+# URL pública cada KEEP_ALIVE_INTERVAL_S segundos (< 15 min) para que nunca
+# llegue a dormirse durante el evento. RENDER_EXTERNAL_URL la pone Render
+# automáticamente en cada web service; ALTUR_SELF_URL permite forzarla en
+# otros hosts. Si no hay URL disponible, el keep-alive simplemente no arranca.
+SELF_URL = os.environ.get("ALTUR_SELF_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+KEEP_ALIVE_INTERVAL_S = int(os.environ.get("ALTUR_KEEP_ALIVE_INTERVAL_S", "600"))
 
 app = FastAPI(title="Altur Challenge - Human vs Synthetic Caller Detector (fusion)")
 
@@ -81,13 +92,33 @@ class DetectResponse(BaseModel):
     confidence: float
 
 
+async def _keep_alive_loop():
+    """Se auto-pinguea cada KEEP_ALIVE_INTERVAL_S para que Render nunca
+    considere el servicio inactivo y lo duerma en medio del evento."""
+    url = SELF_URL.rstrip("/") + "/health"
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL_S)
+        try:
+            await loop.run_in_executor(None, lambda: urllib.request.urlopen(url, timeout=10))
+            print(f"[keep-alive] ping ok -> {url}")
+        except Exception as e:
+            print(f"[keep-alive] ping falló ({url}): {e}")
+
+
 @app.on_event("startup")
-def startup():
+async def startup():
     try:
         _load_model()
         print(f"Modelo cargado desde {MODEL_PATH}")
     except Exception as e:
         print(f"[WARN] Modelo no cargado todavía: {e}")
+
+    if SELF_URL:
+        asyncio.create_task(_keep_alive_loop())
+        print(f"[keep-alive] activado: ping cada {KEEP_ALIVE_INTERVAL_S}s a {SELF_URL}/health")
+    else:
+        print("[keep-alive] desactivado (define ALTUR_SELF_URL si el host no expone RENDER_EXTERNAL_URL)")
 
 
 @app.post("/detect", response_model=None)
