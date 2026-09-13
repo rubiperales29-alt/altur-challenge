@@ -250,6 +250,8 @@ const mLatency = document.getElementById('m-latency');
 const mDuration = document.getElementById('m-duration');
 
 let lastResult = null;
+let isProcessing = false;
+let backendWarm = false;
 
 dropzone.addEventListener('click', () => audioInput.click());
 dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('over'); });
@@ -259,6 +261,24 @@ dropzone.addEventListener('drop', e => {
   if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
 });
 audioInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+// Despierta el backend en cuanto carga la página (Render duerme el servicio
+// tras ~15 min sin tráfico). Así, cuando la persona suelte su primer
+// archivo, lo más probable es que el servicio ya esté caliente.
+async function warmupBackend() {
+  const healthUrl = ENDPOINT.replace(/\/detect$/, '/health');
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 15000);
+      const r = await fetch(healthUrl, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) { backendWarm = true; return; }
+    } catch (_) { /* reintenta */ }
+    await new Promise(res => setTimeout(res, 5000));
+  }
+}
+warmupBackend();
 
 function arrayBufferToBase64(buffer) {
   let binary = ''; const bytes = new Uint8Array(buffer); const chunk = 0x8000;
@@ -347,6 +367,10 @@ function resetStages() {
 }
 
 async function handleFile(file) {
+  if (isProcessing) return; // evita que dos archivos soltados casi al mismo tiempo se pisen
+  isProcessing = true;
+  audioInput.value = ''; // sin esto, elegir el mismo archivo dos veces no vuelve a disparar 'change'
+
   errorEl.style.display = 'none';
   statusEl.style.display = 'block';
   statusEl.textContent = 'Leyendo archivo…';
@@ -356,7 +380,7 @@ async function handleFile(file) {
     const t0 = performance.now();
     const isJsonFile = file.name.toLowerCase().endsWith('.json') || file.type === 'application/json';
 
-    let buffer, requestBody;
+    let buffer, requestBody, declaredSampleRate = null, declaredChannels = null;
 
     if (isJsonFile) {
       // El .json ya trae el payload completo del contrato (call_id,
@@ -373,29 +397,69 @@ async function handleFile(file) {
 
       buffer = base64ToArrayBuffer(b64);
       requestBody = text;
+      declaredSampleRate = parsedJson.sample_rate || null;
+      declaredChannels = parsedJson.channels || null;
     } else {
       buffer = await file.arrayBuffer();
-      requestBody = JSON.stringify({ audio_base64: arrayBufferToBase64(buffer) });
+      requestBody = JSON.stringify({ audio_base64: arrayBufferToBase64(buffer), sample_rate: 8000, channels: 2 });
+      declaredSampleRate = 8000;
+      declaredChannels = 2;
     }
 
-    const parsed = parseWav(buffer);
-    const durationS = parsed.dataSize / (parsed.fmt.sampleRate * parsed.fmt.blockAlign);
+    // Un .json puede traer audio sin header WAV estándar (PCM crudo); el
+    // backend igual lo acepta usando sample_rate/channels declarados. Si no
+    // podemos parsear el header aquí, seguimos sin dibujar la forma de onda
+    // en vez de bloquear todo el análisis — solo un .wav real debe tener
+    // header válido sí o sí.
+    let parsed = null;
+    try {
+      parsed = parseWav(buffer);
+    } catch (e) {
+      if (!isJsonFile) throw e;
+    }
 
-    wavesWrap.style.display = 'flex';
-    drawWaveform(wave0canvas, buffer, parsed, 0);
-    if (parsed.fmt.numChannels > 1) drawWaveform(wave1canvas, buffer, parsed, 1);
+    let durationS = null;
+    if (parsed) {
+      durationS = parsed.dataSize / (parsed.fmt.sampleRate * parsed.fmt.blockAlign);
+      wavesWrap.style.display = 'flex';
+      drawWaveform(wave0canvas, buffer, parsed, 0);
+      if (parsed.fmt.numChannels > 1) drawWaveform(wave1canvas, buffer, parsed, 1);
+    } else {
+      wavesWrap.style.display = 'none';
+      if (declaredSampleRate && declaredChannels) {
+        durationS = buffer.byteLength / 2 / declaredChannels / declaredSampleRate; // asume PCM16
+      }
+    }
     const tDecode = performance.now();
     setStage('stage-decode', '', `${(tDecode - t0).toFixed(0)} ms`);
 
-    statusEl.textContent = 'Enviando al servidor (VAD + features + modelo)…';
+    statusEl.textContent = backendWarm
+      ? 'Enviando al servidor (VAD + features + modelo)…'
+      : 'Despertando el servicio (puede tardar hasta 60s la primera vez)…';
+
+    const ctrl = new AbortController();
+    const timeoutMs = backendWarm ? 35000 : 65000;
+    const timeoutId = setTimeout(() => ctrl.abort(), timeoutMs);
 
     const reqStart = performance.now();
-    const resp = await fetch(ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: requestBody
-    });
+    let resp;
+    try {
+      resp = await fetch(ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: requestBody,
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        throw new Error('el servicio tardó demasiado en responder (probablemente seguía despertando) — intenta de nuevo, el siguiente intento debería ser rápido');
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeoutId);
+    }
     const reqEnd = performance.now();
+    backendWarm = true; // si llegamos aquí, ya respondió una vez
 
     if (!resp.ok) {
       let detail = resp.statusText;
@@ -415,14 +479,19 @@ async function handleFile(file) {
     const totalMs = reqEnd - t0;
     latencyCounter.textContent = `${totalMs.toFixed(0)} ms`;
 
-    statusEl.style.display = 'none';
-    lastResult = { ...data, latency_ms: Math.round(totalMs), duration_s: Number(durationS.toFixed(2)) };
+    lastResult = {
+      ...data,
+      latency_ms: Math.round(totalMs),
+      duration_s: durationS != null ? Number(durationS.toFixed(2)) : null,
+    };
     showVerdict(lastResult);
 
   } catch (err) {
-    statusEl.style.display = 'none';
     errorEl.textContent = 'No se pudo analizar el audio: ' + err.message;
     errorEl.style.display = 'block';
+  } finally {
+    statusEl.style.display = 'none';
+    isProcessing = false;
   }
 }
 
@@ -450,7 +519,7 @@ function showVerdict(r) {
     : 'El patrón acústico y de comportamiento conversacional coincide con el de llamantes humanos en los datos de entrenamiento.';
 
   mLatency.textContent = `${r.latency_ms} ms`;
-  mDuration.textContent = `${r.duration_s}s`;
+  mDuration.textContent = r.duration_s != null ? `${r.duration_s}s` : '—';
 }
 
 document.getElementById('download-json-btn').addEventListener('click', () => {
